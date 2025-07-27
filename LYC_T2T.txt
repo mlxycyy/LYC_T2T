@@ -1,0 +1,292 @@
+#####hifiasm########
+##bam>>fasta
+samtools view ${INPUT}/MYDZ_XY_LYC_hifi_reads.bam | awk '{print ">"$1"\n"$10}' > ${OUTPUT}/MYDZ_XY_LYC_hifi_reads.fasta
+##fq>>fa
+seqkit fq2fa ${INPUT}/m64269e_210715_065610.hifi_reads.fastq > ${OUTPUT}/m64269e_210715_065610.hifi_reads.fasta
+## hifi + hic + ont
+hifiasm -o ${OUTPUT}/MYDZ_XY_LYC_hifi_reads.asm -t8 --h1 ${HIC}/FDHC220004758-1a_1.fq.gz --h2 ${HIC}/FDHC220004758-1a_2.fq.gz --ul ${ONT}/ont.fq.gz ${INPUT}/MYDZ_XY_LYC_hifi_reads.fasta.gz
+##gfa转fa
+awk '/^S/{print ">"$2;print $3}' ${OUTPUT}/MYDZ_XY_LYC_hifi_reads.asm.hic.p_ctg.gfa >  ${OUTPUT}/MYDZ_XY_LYC_hifi_reads.asm.hic.p_ctg.fasta
+
+######juicer + 3D-DNA#####
+##建立索引：
+bwa index lyc_XX_HIC.asm.hic.p_ctg.fasta
+##根据基因组创建可能的酶切位点文件： 
+python ~/software/juicer/juicer/misc/generate_site_positions.py DpnII genome lyc_XX_HIC.asm.hic.p_ctg.fasta
+##获得每条contig长度
+awk 'BEGIN{OFS="\t"}{print $1,$NF}' genome_DpnII.txt > genome.chrom.size
+##运行juice,输出结果在aligned文件夹下，其中merge_nodups.txt是下一步的输入文件之一。主要文件是 .hic 文件，其中的inter_30.hic 是设置了 mapq threshold >30 后得到的结果。
+~/software/juicer/juicer/scripts/juicer.sh -g Larimichthyscrocea_genome -d #全路径# -s DpnII -z ./reference/lyc_XX_HIC.asm.hic.p_ctg.fasta -y ./reference/genome_DpnII.txt -p ./reference/genome.chrom.size -D /public/home/cuiyu/software/juicer/juicer -t 28  &> juicer.log&
+##运行3D-DNA：
+/public/home/cuiyu/software/3d-dna/run-asm-pipeline.sh -r 2 ./reference/DQZ_1116_hap1_new.bp.p_ctg.80.fasta  ./aligned/merged_nodups.txt &> 3d.log &
+##将genome.0.hic和genome.0.assembly文件拷贝到本地，运用juicer-box中进行结果可视化，对可能的错误进行纠正，juicer-box中，常见的错误包括切割misjoin，移动translocations，翻转inversions，确定染色体边界chromosome boundAries。输出genome.0.review.assembly文件。
+##再次运行3D-DNA：
+/public/home/cuiyu/software/3d-dna/run-asm-pipeline-post-review.sh -r genome.0.review.assembly ./reference/lyc_XX_HIC.asm.hic.p_ctg.fasta ./aligned/merge_nodups.txt &> 3d.log &
+
+######verkko#####
+verkko -d ${output} --hifi ${ccs} --nano ${ont} --hic1 ${hic1} --hic2 ${hic2} --threads 32
+
+####mummer####
+nucmer -t 14 --mum lyc_verkko_genomic.fa lyc_HIC.asm.hic.p_ctg.FINAL.fasta
+delta-filter -i 94 -l 10000 -1 hifiasm_vs_verkko.delta > hifiasm_vs_verkko.delta.filter
+show-coords -r hifiasm_vs_verkko.delta.filter.delta > hifiasm_vs_verkko.delta.filter.coords
+mummerplot --png -large -p hifiasm_vs_verkko.delta.filter hifiasm_vs_verkko.delta.filter.delta
+
+#####gap-filling#######
+## raw ONT reads with error correction using NGS reads
+tgsgapcloser \
+        --scaff  $REF \
+        --reads  $ONT \
+        --output  $OUTPUT2 \
+        --pilon  ~/miniconda3/envs/tgsgapcloser/bin/pilon  \
+        --ngs  /data3/cuiyu/2022-MYDZ_LYC/illumina/FDES22H000134.fq.gz  \
+        --samtools  ~/miniconda3/envs/tgsgapcloser/bin/samtools  \
+        --java  ~/miniconda3/envs/tgsgapcloser/bin/java \
+        >$OUTPUT2/NGSpilon.log 2>$OUTPUT2/NGSpilon.err
+
+
+######polish########
+###make polish_run.cfg
+[General]
+job_type = local
+job_prefix = nextPolish
+task = best
+rewrite = yes
+deltmp = yes
+rerun = 3
+parallel_jobs = 6
+multithread_jobs = 10
+genome = /data9/cuiyu/CYY/MYDZ_0416hifiasm/3D-DNA/hap1/polish/MYDZ_hap1_ont.ne.scaff_seqs
+genome_size = auto
+workdir = /data9/cuiyu/CYY/MYDZ_0416hifiasm/3D-DNA/hap1/polish
+polish_options = -p {multithread_jobs}
+#[sgs_option] #optional
+sgs_fofn = ./sgs.fofn
+sgs_options = -max_depth 100 -bwa
+#[lgs_option] #optional
+lgs_fofn = ./lgs.fofn
+lgs_options = -min_read_len 1k -max_depth 100
+lgs_minimap2_options = -x map-ont
+#[hifi_option] #optional
+hifi_fofn = ./hifi.fofn
+hifi_options = -min_read_len 1k -max_read_len 150k
+hifi_minimap2_options = -x asm20
+####run
+nextPolish ./polish_run.cfg
+
+#######Telomeric########
+python3 ~/software/quarTeT-1.16/quartet.py TeloExplorer -i ${ref}  -c animal -p ${pre}
+
+#######Centromere#######
+python3 ~/software/quarTeT-1.16/quartet.py CentroMiner -i ./reference/${ref}.fasta -p ./${ref} -t 8
+centromics -l ont.fq.gz -g ${ref} -pre ont  -hic merged_nodups.hic
+
+####Assessment of genome assemblies######
+###reads map
+bwa mem -Y -t 2 -R "@RG\tID:${sample}_${PBS_ARRAYID}\tSM:${sample}\tLB:$library\tPL:illumina" lyc_T2T.fasta illumina_R1.fq.gz illumina_R2.fq.gz | sambamba markdup -r – mkdup.bam
+minimap2 -ax map-ont lyc_T2T.fasta ont.fq.gz | samtools view -bSu - |samtools sort -o ont.map.bam
+minimap2 -ax map-hifi lyc_T2T.fasta pacbio_hifi.fq.gz | samtools view -bSu - |samtools sort -o hifi.map.bam
+samtools depth maped.bam
+
+###merquery
+best_k.sh 700000000
+meryl k=19.6736 count output read1.meryl illumina_R1.fq.gz
+mery2 k=19.6736 count output read2.mery1 illumina_R2.fq.gz
+meryl  union-sum output merge.meryl read*meryl
+merqury.sh merge.meryl lyc_T2T.fasta result
+
+###compleasm
+compleasm run -a ${ref1} -o ${out1} -t 4 --autolineage
+
+###GCI 
+python GCI.py -r lyc_T2T.fasta --hifi pacbio_hifi.fq.gz --nano ont.fq.gz -t 32 -o lyc_T2T -p -f
+
+#####annotation#######
+###repeats
+RepeatMasker -pa 4 -e ncbi -species "Actinopterygii" -dir repeatMasker/ -gff ${genome}.fasta
+BuildDatabase -name MYDZ_XY_main -engine ncbi ${genome}
+RepeatModeler -engine ncbi -pa 4 -database repeatMasker/${genome}
+RepeatMasker -pa 14 -e ncbi -lib consensi.fa -dir ${input2} -gff ${genome}
+
+mkdir ProcessRepeats
+cd ProcessRepeats
+cp ../*.gz ./1.gz
+cp ../repeatModeler/*.gz ./2.gz
+zcat 1.gz 2.gz > 12.sum
+gzip lyc.sum
+/public/home/yuanyingbo/software/RepeatMasker/ProcessRepeats -species "Actinopterygii" lyc.sum.gz
+
+####phylogenomic analysis###
+##orthofinder
+orthofinder -f longeatcds/ -M msa -S diamond -T iqtree -t 40 -a 40 2> orthofinder.log
+
+##r8s
+-s : seqkit stat MultipleSequenceAlignments/SpeciesTreeAlignment.fa min_len
+r8s -b -f r8s_ctl_file.txt > r8s_tmp.txt
+tail -n 1 r8s_tmp.txt | cut -c 16- > twelve_spp_r8s_ultrametric.txt
+
+###cafe5
+load -i sum_cafe.input.data -t 8 -l sum.log -p 0.05
+tree ((Homo_sapiens:87.000000,Mus_musculus:87.000000):444.400877,(((((((((MYDZ_protein:4.646355,DQZ_protein:4.646355):12.922928,Collichthys_lucidus:17.569283):12.837890,Nibea_albiflora:30.407173):50.360360,Dicentrarchus_labrax:80.767533):26.599800,Takifugu_rubripes:107.367334):10.095843,Gasterosteus_aculeatus:117.463177):20.557501,Oryzias_latipes:138.020677):58.112594,Gadus_morhua:196.133271):84.696879,Danio_rerio:280.830150):250.570727)
+lambda -s -t ((1,1)1,(((((((((1,1)1,1)1,1)1,1)1,1)1,1)1,1)1,1)1,1)1)
+report sum_results
+
+##格式整理
+awk -v OFS="\t" '{$NF=null;print $1,$0}' Orthogroups.GeneCount.tsv |sed -E -e 's/Orthogroup/desc/' -e 's/_[^\t]+//g' >gene_families.txt
+awk 'NR==1 || $3<100 && $4<100 && $5<100 && $6<100 && $7<100 && $8<100 && $9<100 && $10<100 && $11<100 && $12<100 && $13<100 {print $0}' gene_families.txt >gene_families_filter.txt
+cafe5 -i gene_families_filter.txt -t tree.txt -p -k 2 -o k2p
+
+##提取MYD和DQ收缩扩张家族
+cat Gamma_change.tab |cut -f1,4|awk '$2>0 {print}' > sample.expanded
+cat Gamma_change.tab |cut -f1,4|grep "-" > sample.contracted
+grep "DQ<4>\*" Gamma_asr.tre > sample_significant_trees.tre 
+grep -E -o "OG[0-9]+" sample_significant_trees.tre > sample_significant.ogs
+awk '$2 <0.05 {print $1}' Gamma_family_results.txt >p0.05_significant.ogs 
+grep -f sample_significant.ogs p0.05_significant.ogs > sample_p0.05_significant.ogs 
+grep -f sample_p0.05_significant.ogs sample.expanded |cut -f1 >s ample.expanded.significant
+grep -f sample_p0.05_significant.ogs sample.contracted |cut -f1 > sample.contracted.significant
+grep -f sample.expanded.significant Orthogroups.txt |sed "s/ /\n/g"|grep "bv" |sort -k 1.3n |uniq >sample.expanded.significant.genes 
+grep -f sample.contracted.significant Orthogroups.txt sed "s/ /\n/g"|grep "bv" |sort -k 1.3n |uniq >sample.contracted.significant.genes
+seqkit grep -f sample.expanded.significant.genes sample.pep.fa >sample.expanded.significant.pep.fa 
+seqkit grep -f sample.contracted.significant.genes sample.pep.fa >sample.contracted.significant.pep.fa
+
+####Selective pressure analysis###
+使用脚本generate_conf.py：https://github.com/xuzhougeng/myscripts/blob/master/comparative/generate_conf.py 从基因组genome.fa和注释文件sample.gff3中获取input.gff和input.len文件。
+python generate_conf.py -p input genome.fa sample.gff3
+##blastp
+blastp -num_threads 32 -db sample.pep.fasta -query sample.pep.fa -outfmt 6 -evalue 1e-5 -num_alignments 20 -out sample.blastp.txt
+wgdi -d ? >input.conf
+wgdi -d input.conf
+wgdi -icl ? >>input.conf
+wgdi -icl input.conf
+wgdi -ks ? >>input.conf
+wgdi -ks input.conf
+wgdi -bi ? >>input.conf
+wgdi -bi input.conf
+wgdi -bk ? >>input.conf
+wgdi -bk input.conf
+wgdi -kp ? >>input.conf
+wgdi -kp input.conf
+
+#######SV Analysis###############
+###基于illumina reads
+bwa mem -t $nprocs -Y -M -R "@RG\tID:${Name}_${LIBRARY}_${LANE}\tLB:${SM}_Lib1\tPL:ILLUMINA\tSM:${SM}" ${ref1}  ${INPUTFQ}/${Sample}_1.clean.fastq.gz ${INPUTFQ}/${Sample}_2.clean.fastq.gz | $SAMTOOLS view -bSu - | $SAMTOOLS sort -@ $nprocs -o ${output1}/dq_${Sample}.bam
+sambamba markdup -t $nprocs --tmpdir ${output1} ${output1}/dq_${Sample}.bam ${output1}/map_${Sample}.mk.bam
+cat chromesome.txt while read id; do nohup delly call -g /data3/cuiyu/2022-MYDZ_LYC/genome/reference/MYDZ_XY_main.nextpolish.fasta -o ./DQZ_vs.MYDZ.${id##_*}.delly.bcf sample*.bam
+bcftools view -O v -o delly.vcf delly.bcf
+
+###基于hifi reads
+####syri
+python3 syri -c map.bam -r lyc_DQ_T2T.fasta -q querygenome -k -F B
+###pbsv 
+pbsv call -O 5 -j 30 lyc_T2T.fasta lyc.svsig.gz lyc.pbsv.vcf --call-min-reads-one-sample 50 --call-min-reads-all-samples 50
+###CuteSV
+CuteSV ${input} ${ref} ${pre}.vcf ${dir}
+###SURVIVOR
+SURVIVOR merge merge_files 1000 2 1 1 0 30 merged.vcf
+
+###########Genetic diversity analysis############
+###SNP calling
+bwa mem -Y -t $NCPUS \
+        -R "@RG\tID:${sample}_${PBS_ARRAYID}\tSM:${sample}\tLB:$library\tPL:illumina" \
+        $INDEX $fq1 $fq2 | samtools sort -@ $NCPUS  -o $outdir/${name}_sort.bam -
+sambamba-0.7.1 markdup \
+    -t ${nprocs} \
+    --tmpdir $outdir/tmp/mapmydbam \
+    -r $bam \
+    $outdir/mapmydbam/${sample}_mkdup.bam
+gatk HaplotypeCaller
+        -ERC GVCF \
+        -R ${reference} \
+        -I $indir/mapmydbam/${sample}.bam \
+        -ploidy 2 \
+        --tmp-dir $outdir/${ns}/tmp_dqzmapmyd \
+        --native-pair-hmm-threads ${nprocs} \
+        --pcr-indel-model CONSERVATIVE \
+        --read-filter MappingQualityReadFilter --minimum-mapping-quality 20 \
+       -O $outdir/${ns}/Chr_gvcf_dqzmapmyd/${sample}_HC_gvcf.gz && echo "** ${sample}_HC_gvcf.gz done **"
+gatk CombineGVCFs \
+    -R ${reference} \
+    ${SmGvcfs} \
+    -L $chr \
+    --tmp-dir $outdir/TMP/CbGVCFtmp_dqzmapmyd \
+    -O $outdir/${ns}/CbSMDvChr_dqzmapmyd/${prefix}_HC.gvcf.gz && echo "** ${prefix}_HC.gvcf.gz done! ** " && \
+gatk GenotypeGVCFs \
+    -R ${reference} \
+    -V $outdir/${ns}/CbSMDvChr_dqzmapmyd/${prefix}_HC.gvcf.gz \
+    --tmp-dir $outdir/TMP/GtGVCFtmp_dqzmapmyd \
+    -O $outdir/${ns}/gVCFs_dqzmapmyd/${prefix}_HC.vcf.gz && echo "** ${prefix}_HC.vcf.gz done! ** "
+gatk SelectVariants \
+    -select-type SNP \
+    -restrict-alleles-to BIALLELIC \
+    -V ${infile}/${fn} \
+    -O ${outdir}/ftSnpIndel_mydz/${vcf_file}.snp.vcf.gz
+gatk VariantFiltration \
+    -V ${outdir}/ftSnpIndel_mydz/${vcf_file}.snp.vcf.gz \
+    --filter-expression "QD < 2.0 || MQ < 40.0 || FS > 60.0 || SOR > 3.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0" \
+    --filter-name "Filter" \
+    -O ${outdir}/ftSnpIndel_mydz/${vcf_file}.snp.filter.vcf.gz
+bcftools view -i 'FILTER="PASS" & F_MISSING<0.2' ${tag} -Oz -o ${OUTPUT}/${tag_basename}_gatk_pass_vcf.gz
+vcftools --gzvcf ${OUTPUT}/${tag_basename}_gatk_pass_vcf.gz --out ${OUTPUT}/${tag_basename}_gatk_pass_maf0.05 -maf 0.05 -hwe 0.00001  
+
+#######pi、Tajima'D and FST
+##pi
+vcftools --vcf Filter.snp.vcf --window-pi 10000 --out pi
+##Tajima'D
+vcftools --vcf Filter.snp.vcf --TajimaD 10000 --out Tajima
+##FST
+vcftools --vcf sum.vcf --weir-fst-pop MYDZ.txt --weir-fst-pop DQZ.txt --out sample_1_2 
+
+#####Effective population size####
+samtools mpileup -Q 30 -q 30 -u -v -f genome.fasta sample.bam | bcftools view -c - |bcftools filter -e "F_MISSING > 0.2 || MAF < 0.05"| vcfutils.pl vcf2fq -d 15 -D 45 | gzip > psmc.fq.gz.
+fq2psmcfa -q20 sample.psmc.fq.gz> sample.psmc.fa
+pamc -N 25 -p "4+25*2+4+6" -t 2 -r 5 sample.psmc sample.psmc.fa
+psmc_plot.pl -u 5e-09 -g 2 -p pamc_plot merge.psmc
+
+plink  --vcf snp.vcf  --make-bed  --maf 0.05 --hwe 0.00001 --allow-no-sex --allow-extra-chr --autosome-num 24 --out snp.maf.filter
+plink  --bfile snp.maf.filter --recode 12 --transpose --allow-no-sex --allow-extra-chr --autosome-num 24 --out snp.maf.filter
+gone2 -r 3.3 snp.maf.filter.tped
+
+############Methylation########
+###basecalling
+guppy_basecaller -i ../fast5_pass/singlefast5/PAM48436_pass_faf30c8d_${i}.single.fast5/0/ -s ./guppy-results/${i}.basecalling -c ~/software/ont-guppy-cpu/data/dna_r9.4.1_450bps_fast.cfg --fast5_out on --num_callers 4 --cpu_threads_per_caller 3 --compress_fastq
+###call-methylation
+minimap2 -a -x map-ont ${ref} ${fq} |${samtools} sort -T tmp -o ${output}/DQZ_XY_1108.rp.ont.nano.sorted.bam
+nanopolish call-methylation -t 12 -r ${fq} -b ${output}/MYDZ_hap1.ont.nano.sorted.bam -g ${ref1}  > ${output}/MYDZ_hap1_methylation_calls.tsv
+###filter
+calculate_methylation_frequency.py ${output}/MYDZ_hap1_methylation_calls.tsv > ${output}/MYDZ_hap1_methylation_frequency.tsv
+
+###########A/B compartments#######
+HiC-Pro -i MYDZ_hicdata -o MYDZ_hicpro_output -c config-hicpro.txt
+hicpro2juicebox.sh -i ./MYDZ.allValidPairs -g ./MYDZ_XY_main.nextpolish.fasta.len -j ~/software/juicer/juicer/scripts/common/juicer_tools.jar
+fanc compartments  MYDZ.allValidPairs.hic@250kb  MYDZ.allValidPairs.250kb.ab
+fanc compartments -v MYDZ.allValidPairs.250kb.ev.txt   MYDZ.allValidPairs.hic@250kb MYDZ.allValidPairs.250kb.ab
+
+#####RNA-seq######
+STAR --runMode genomeGenerate --genomeSAindexNbases 14 --genomeSAsparseD 2 --genomeDir ${REF} --genomeFastaFiles ${REF}/LYC_chr.fasta --runThreadN ${nprocs}
+STAR --runMode alignReads \
+--runThreadN ${nprocs} \
+--genomeDir ${REF} \
+--readFilesIn ${INPUT}/${Sample2}_1.clean.fq.gz ${INPUT}/${Sample2}_2.clean.fq.gz \
+--readFilesCommand zcat \
+--clip5pNbases 0 5 \
+--clip3pNbases 0 25 \
+--outSJfilterOverhangMin 30 12 12 12 \
+--outSJfilterCountUniqueMin 4 2 2 2 \
+--alignSJoverhangMin 6 \
+--outFilterType BySJout \
+--outSAMstrandField intronMotif \
+--outFilterIntronMotifs RemoveNoncanonical \
+--alignIntronMax 500000 \
+--alignMatesGapMax 500000 \
+--outFilterMismatchNoverReadLmax 1.0 \
+--outFileNamePrefix ${OUTPUT}/${Sample} \
+--outStd SAM \
+--outSAMmode Full | ${SAMTOOLS} view -bS - > ${OUTPUT}/${Sample}.bam
+
+StringTie --merge -o Stringtie_merged_LYC_gonad.gtf -G /reference/genome.gtf -l LYC ${OUTPUT}/gonad.list
+FeatureCounts -T ${nprocs} -s 0 -t exon -g gene_id -p -Q 20 --fracOverlap 0.8  -a ${OUTPUT}/Stringtie_merged_LYC_gonad.gtf -o ${OUTPUT}/${Sample}.FC.txt  ${OUTPUT}/${Sample}.sorted.bam
+python2 extract_featureCounts_info.py  -I ${OUTPUT}/${Sample}.FC.txt  -O  ${OUTPUT}/${Sample}.count  -numCol  2
+
+
+
